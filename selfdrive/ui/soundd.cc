@@ -86,7 +86,7 @@ private slots:
       if (alert.sound != AudibleAlert::NONE) {
         auto &[s, loops] = sounds[alert.sound];
         s->setLoopCount(loops);
-        s->setVolume(volume);
+        s->setVolume(volume*0.1);
         s->play();
       }
     }
