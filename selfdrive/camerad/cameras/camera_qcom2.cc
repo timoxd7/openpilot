@@ -68,7 +68,7 @@ int cam_control(int fd, int op_code, void *handle, int size) {
     camcontrol.handle_type = CAM_HANDLE_USER_POINTER;
   }
 
-  int ret = ioctl(fd, VIDIOC_CAM_CONTROL, &camcontrol);
+  int ret = HANDLE_EINTR(ioctl(fd, VIDIOC_CAM_CONTROL, &camcontrol));
   if (ret == -1) {
     printf("OP CODE ERR - %d \n", op_code);
     perror("wat");
@@ -493,7 +493,7 @@ void enqueue_buffer(struct CameraState *s, int i, bool dp) {
   struct cam_mem_mgr_map_cmd mem_mgr_map_cmd = {0};
   mem_mgr_map_cmd.mmu_hdls[0] = s->multi_cam_state->device_iommu;
   mem_mgr_map_cmd.num_hdl = 1;
-  mem_mgr_map_cmd.flags = 1;
+  mem_mgr_map_cmd.flags = CAM_MEM_FLAG_HW_READ_WRITE;
   mem_mgr_map_cmd.fd = s->buf.camera_bufs[i].fd;
   ret = cam_control(s->multi_cam_state->video0_fd, CAM_REQ_MGR_MAP_BUF, &mem_mgr_map_cmd, sizeof(mem_mgr_map_cmd));
   // LOGD("map buf req: (fd: %d) 0x%x %d", s->bufs[i].fd, mem_mgr_map_cmd.out.buf_handle, ret);
@@ -540,41 +540,26 @@ static void camera_init(MultiCameraState *multi_cam_state, VisionIpcServer * v, 
   s->buf.init(device_id, ctx, s, v, FRAME_BUF_COUNT, rgb_type, yuv_type);
 }
 
-// TODO: refactor this to somewhere nicer, perhaps use in camera_qcom as well
-static int open_v4l_by_name_and_index(const char name[], int index, int flags) {
-  char nbuf[0x100];
-  int v4l_index = 0;
-  int cnt_index = index;
-  while (true) {
-    snprintf(nbuf, sizeof(nbuf), "/sys/class/video4linux/v4l-subdev%d/name", v4l_index);
-    FILE *f = fopen(nbuf, "rb");
-    if (f == NULL) return -1;
-    int len = fread(nbuf, 1, sizeof(nbuf), f);
-    fclose(f);
-
-    // name ends with '\n', remove it
-    if (len < 1) return -1;
-    nbuf[len-1] = '\0';
-
-    if (strcmp(nbuf, name) == 0) {
-      if (cnt_index == 0) {
-        snprintf(nbuf, sizeof(nbuf), "/dev/v4l-subdev%d", v4l_index);
-        LOGD("open %s for %s index %d", nbuf, name, index);
-        return open(nbuf, flags);
+int open_v4l_by_name_and_index(const char name[], int index, int flags = O_RDWR | O_NONBLOCK) {
+  for (int v4l_index = 0; /**/; ++v4l_index) {
+    std::string v4l_name = util::read_file(util::string_format("/sys/class/video4linux/v4l-subdev%d/name", v4l_index));
+    if (v4l_name.empty()) return -1;
+    if (v4l_name.find(name) == 0) {
+      if (index == 0) {
+        return open(util::string_format("/dev/v4l-subdev%d", v4l_index).c_str(), flags);
       }
-      cnt_index--;
+      index--;
     }
-    v4l_index++;
   }
 }
 
 static void camera_open(CameraState *s) {
   int ret;
-  s->sensor_fd = open_v4l_by_name_and_index("cam-sensor-driver", s->camera_num, O_RDWR | O_NONBLOCK);
+  s->sensor_fd = open_v4l_by_name_and_index("cam-sensor-driver", s->camera_num);
   assert(s->sensor_fd >= 0);
   LOGD("opened sensor");
 
-  s->csiphy_fd = open_v4l_by_name_and_index("cam-csiphy-driver", s->camera_num, O_RDWR | O_NONBLOCK);
+  s->csiphy_fd = open_v4l_by_name_and_index("cam-csiphy-driver", s->camera_num);
   assert(s->csiphy_fd >= 0);
   LOGD("opened csiphy");
 
@@ -582,10 +567,12 @@ static void camera_open(CameraState *s) {
   LOGD("-- Probing sensor %d", s->camera_num);
   sensors_init(s->multi_cam_state->video0_fd, s->sensor_fd, s->camera_num);
 
-  memset(&s->req_mgr_session_info, 0, sizeof(s->req_mgr_session_info));
-  ret = cam_control(s->multi_cam_state->video0_fd, CAM_REQ_MGR_CREATE_SESSION, &s->req_mgr_session_info, sizeof(s->req_mgr_session_info));
-  LOGD("get session: %d 0x%X", ret, s->req_mgr_session_info.session_hdl);
-  s->session_handle = s->req_mgr_session_info.session_hdl;
+  // create session
+  struct cam_req_mgr_session_info session_info = {}; 
+  ret = cam_control(s->multi_cam_state->video0_fd, CAM_REQ_MGR_CREATE_SESSION, &session_info, sizeof(session_info));
+  LOGD("get session: %d 0x%X", ret, session_info.session_hdl);
+  s->session_handle = session_info.session_hdl;
+
   // access the sensor
   LOGD("-- Accessing sensor");
   static struct cam_acquire_dev_cmd acquire_dev_cmd = {0};
@@ -728,8 +715,10 @@ static void camera_open(CameraState *s) {
     int ret = cam_control(s->csiphy_fd, CAM_CONFIG_DEV, &config_dev_cmd, sizeof(config_dev_cmd));
     assert(ret == 0);
 
-    release(s->multi_cam_state->video0_fd, buf_desc[0].mem_handle);
-    release(s->multi_cam_state->video0_fd, cam_packet_handle);
+    munmap(csiphy_info, buf_desc[0].size);
+    release_fd(s->multi_cam_state->video0_fd, buf_desc[0].mem_handle);
+    munmap(pkt, size);
+    release_fd(s->multi_cam_state->video0_fd, cam_packet_handle);
   }
 
   // link devices
@@ -744,19 +733,19 @@ static void camera_open(CameraState *s) {
   s->link_handle = req_mgr_link_info.link_hdl;
 
   static struct cam_req_mgr_link_control req_mgr_link_control = {0};
-  req_mgr_link_control.ops = 0;
+  req_mgr_link_control.ops = CAM_REQ_MGR_LINK_ACTIVATE;
   req_mgr_link_control.session_hdl = s->session_handle;
   req_mgr_link_control.num_links = 1;
   req_mgr_link_control.link_hdls[0] = s->link_handle;
   ret = cam_control(s->multi_cam_state->video0_fd, CAM_REQ_MGR_LINK_CONTROL, &req_mgr_link_control, sizeof(req_mgr_link_control));
   LOGD("link control: %d", ret);
 
-  LOGD("start csiphy: %d", ret);
   ret = device_control(s->csiphy_fd, CAM_START_DEV, s->session_handle, s->csiphy_dev_handle);
-  LOGD("start isp: %d", ret);
+  LOGD("start csiphy: %d", ret);
   ret = device_control(s->multi_cam_state->isp_fd, CAM_START_DEV, s->session_handle, s->isp_dev_handle);
-  LOGD("start sensor: %d", ret);
+  LOGD("start isp: %d", ret);
   ret = device_control(s->sensor_fd, CAM_START_DEV, s->session_handle, s->sensor_dev_handle);
+  LOGD("start sensor: %d", ret);
 
   enqueue_req_multi(s, 1, FRAME_BUF_COUNT, 0);
 }
@@ -812,9 +801,9 @@ void cameras_open(MultiCameraState *s) {
   // subscribe
   LOG("-- Subscribing");
   static struct v4l2_event_subscription sub = {0};
-  sub.type = 0x8000000;
+  sub.type = V4L_EVENT_CAM_REQ_MGR_EVENT;
   sub.id = 2; // should use boot time for sof
-  ret = ioctl(s->video0_fd, VIDIOC_SUBSCRIBE_EVENT, &sub);
+  ret = HANDLE_EINTR(ioctl(s->video0_fd, VIDIOC_SUBSCRIBE_EVENT, &sub));
   printf("req mgr subscribe: %d\n", ret);
 
   camera_open(&s->road_cam);
@@ -839,7 +828,7 @@ static void camera_close(CameraState *s) {
   // link control stop
   LOG("-- Stop link control");
   static struct cam_req_mgr_link_control req_mgr_link_control = {0};
-  req_mgr_link_control.ops = 1;
+  req_mgr_link_control.ops = CAM_REQ_MGR_LINK_DEACTIVATE;
   req_mgr_link_control.session_hdl = s->session_handle;
   req_mgr_link_control.num_links = 1;
   req_mgr_link_control.link_hdls[0] = s->link_handle;
@@ -863,7 +852,9 @@ static void camera_close(CameraState *s) {
   ret = device_control(s->csiphy_fd, CAM_RELEASE_DEV, s->session_handle, s->csiphy_dev_handle);
   LOGD("release csiphy: %d", ret);
 
-  ret = cam_control(s->multi_cam_state->video0_fd, CAM_REQ_MGR_DESTROY_SESSION, &s->req_mgr_session_info, sizeof(s->req_mgr_session_info));
+  // destroyed session
+  struct cam_req_mgr_session_info session_info = {.session_hdl = s->session_handle};
+  ret = cam_control(s->multi_cam_state->video0_fd, CAM_REQ_MGR_DESTROY_SESSION, &session_info, sizeof(session_info));
   LOGD("destroyed session: %d", ret);
 }
 
@@ -1096,22 +1087,26 @@ void cameras_run(MultiCameraState *s) {
     if (!fds[0].revents) continue;
 
     struct v4l2_event ev = {0};
-    ret = ioctl(fds[0].fd, VIDIOC_DQEVENT, &ev);
-    if (ev.type == 0x8000000) {
-      struct cam_req_mgr_message *event_data = (struct cam_req_mgr_message *)ev.u.data;
-      // LOGD("v4l2 event: sess_hdl %d, link_hdl %d, frame_id %d, req_id %lld, timestamp 0x%llx, sof_status %d\n", event_data->session_hdl, event_data->u.frame_msg.link_hdl, event_data->u.frame_msg.frame_id, event_data->u.frame_msg.request_id, event_data->u.frame_msg.timestamp, event_data->u.frame_msg.sof_status);
-      // printf("sess_hdl %d, link_hdl %d, frame_id %lu, req_id %lu, timestamp 0x%lx, sof_status %d\n", event_data->session_hdl, event_data->u.frame_msg.link_hdl, event_data->u.frame_msg.frame_id, event_data->u.frame_msg.request_id, event_data->u.frame_msg.timestamp, event_data->u.frame_msg.sof_status);
+    ret = HANDLE_EINTR(ioctl(fds[0].fd, VIDIOC_DQEVENT, &ev));
+    if (ret == 0) {
+      if (ev.type == V4L_EVENT_CAM_REQ_MGR_EVENT) {
+        struct cam_req_mgr_message *event_data = (struct cam_req_mgr_message *)ev.u.data;
+        // LOGD("v4l2 event: sess_hdl %d, link_hdl %d, frame_id %d, req_id %lld, timestamp 0x%llx, sof_status %d\n", event_data->session_hdl, event_data->u.frame_msg.link_hdl, event_data->u.frame_msg.frame_id, event_data->u.frame_msg.request_id, event_data->u.frame_msg.timestamp, event_data->u.frame_msg.sof_status);
+        // printf("sess_hdl %d, link_hdl %d, frame_id %lu, req_id %lu, timestamp 0x%lx, sof_status %d\n", event_data->session_hdl, event_data->u.frame_msg.link_hdl, event_data->u.frame_msg.frame_id, event_data->u.frame_msg.request_id, event_data->u.frame_msg.timestamp, event_data->u.frame_msg.sof_status);
 
-      if (event_data->session_hdl == s->road_cam.req_mgr_session_info.session_hdl) {
-        handle_camera_event(&s->road_cam, event_data);
-      } else if (event_data->session_hdl == s->wide_road_cam.req_mgr_session_info.session_hdl) {
-        handle_camera_event(&s->wide_road_cam, event_data);
-      } else if (event_data->session_hdl == s->driver_cam.req_mgr_session_info.session_hdl) {
-        handle_camera_event(&s->driver_cam, event_data);
-      } else {
-        printf("Unknown vidioc event source\n");
-        assert(false);
+        if (event_data->session_hdl == s->road_cam.session_handle) {
+          handle_camera_event(&s->road_cam, event_data);
+        } else if (event_data->session_hdl == s->wide_road_cam.session_handle) {
+          handle_camera_event(&s->wide_road_cam, event_data);
+        } else if (event_data->session_hdl == s->driver_cam.session_handle) {
+          handle_camera_event(&s->driver_cam, event_data);
+        } else {
+          printf("Unknown vidioc event source\n");
+          assert(false);
+        }
       }
+    } else {
+      LOGE("VIDIOC_DQEVENT failed, errno=%d", errno);
     }
   }
 
