@@ -33,6 +33,8 @@ class CarInterface(CarInterfaceBase):
       ret.safetyModel = car.CarParams.SafetyModel.volkswagenPq
       ret.enableBsm = 0x3BA in fingerprint[0]
 
+      ret.openpilotLongitudinalControl = True  # FIXME: Hardcoded now for e-up test.
+
       if 0x440 in fingerprint[0]:  # Getriebe_1 detected: traditional automatic or DSG gearbox
         ret.transmissionType = TransmissionType.automatic
       else:  # No trans message at all, must be a true stick-shift manual

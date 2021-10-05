@@ -1,3 +1,4 @@
+from common.numpy_fast import interp
 from cereal import car
 from selfdrive.car import apply_std_steer_torque_limits
 from selfdrive.car.volkswagen import volkswagencan
@@ -5,6 +6,11 @@ from selfdrive.car.volkswagen.values import PQ_CARS, DBC_FILES, CANBUS, NetworkL
 from opendbc.can.packer import CANPacker
 
 VisualAlert = car.CarControl.HUDControl.VisualAlert
+
+ACCEL_LOOKUP_BP = [-1., 0., P.MAX_GAS / P.MAX_BRAKE]
+ACCEL_LOOKUP_V = [-P.MAX_BRAKE, 0., P.MAX_GAS]
+
+ACCEL_SCALE = max(P.MAX_GAS, P.MAX_BRAKE)
 
 class CarController():
   def __init__(self, dbc_name, CP, VM):
@@ -16,8 +22,9 @@ class CarController():
     self.graMsgSentCount = 0
     self.graMsgStartFramePrev = 0
     self.graMsgBusCounterPrev = 0
+    self.isPQ = CP.carFingerprint in PQ_CARS
 
-    if CP.carFingerprint in PQ_CARS:
+    if self.isPQ:
       self.packer_pt = CANPacker(DBC_FILES.pq)
       self.create_steering_control = volkswagencan.create_pq_steering_control
       self.create_acc_buttons_control = volkswagencan.create_pq_acc_buttons_control
@@ -41,6 +48,20 @@ class CarController():
     """ Controls thread """
 
     can_sends = []
+
+    # **** Acceleration and Braking Controls ******************************** #
+
+    if CS.CP.openpilotLongitudinalControl and self.isPQ:
+      acc_status = 3 if enabled else 2
+
+      accel = round(actuators.gas - actuators.brake, 2)
+      apply_accel = interp(accel, ACCEL_LOOKUP_BP, ACCEL_LOOKUP_V)
+      stop_req = apply_accel <= 0. and CS.out.vEgo < 0.1
+
+      if frame % P.ACC_CONTROL_STEP == 0:
+        idx = (frame / P.ACC_CONTROL_STEP) % 16
+        can_sends.append(volkswagencan.create_pqb_acc_control(self.packer_pt, CANBUS.pt, acc_status, apply_accel,
+                                                              stop_req, CS.out.standstill, idx))
 
     # **** Steering Controls ************************************************ #
 
