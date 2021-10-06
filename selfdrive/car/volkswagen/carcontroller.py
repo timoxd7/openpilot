@@ -60,7 +60,7 @@ class CarController():
 
       if frame % P.ACC_CONTROL_STEP == 0:
         idx = (frame / P.ACC_CONTROL_STEP) % 16
-        can_sends.append(volkswagencan.create_pqb_acc_control(self.packer_pt, CANBUS.pt, acc_status, apply_accel,
+        can_sends.append(volkswagencan.create_pq_acc_control(self.packer_pt, CANBUS.pt, acc_status, apply_accel,
                                                               stop_req, CS.out.standstill, idx))
 
     # **** Steering Controls ************************************************ #
