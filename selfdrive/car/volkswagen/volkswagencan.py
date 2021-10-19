@@ -141,7 +141,7 @@ def create_pq_acc_control(packer, bus, acc_status, apply_accel, stop_req, stands
     "ACS_max_AendGrad": 0.25 if acc_status == 3 and not stop_req else 0,  # FIXME: need comfort regulation logic here
   }
 
-  dat = packer.make_can_msg("ACC_System", bus, values, idx)[2]
+  dat = packer.make_can_msg("ACC_System", bus, values)[2]
   values["ACS_Checksum"] = dat[1] ^ dat[2] ^ dat[3] ^ dat[4] ^ dat[5] ^ dat[6] ^ dat[7]
   return packer.make_can_msg("ACC_System", bus, values)
 
@@ -154,6 +154,6 @@ def create_pq_acc_hud_control(packer, bus, acc_status, speed_visible, set_speed,
     "ACA_PrioDisp": 1,
   }
 
-  dat = packer.make_can_msg("ACC_GRA_Anziege", bus, values, idx)[2]
+  dat = packer.make_can_msg("ACC_GRA_Anziege", bus, values)[2]
   values["ACA_Checksum"] = dat[1] ^ dat[2] ^ dat[3] ^ dat[4] ^ dat[5] ^ dat[6] ^ dat[7]
   return packer.make_can_msg("ACC_GRA_Anziege", bus, values)
